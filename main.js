@@ -14,10 +14,7 @@ async function workerCheckAvailability(browserWSEndpoint, usernamesToCheck) {
   try {
     browser = await puppeteer.connect({ browserWSEndpoint });
     const page = await browser.newPage();
-    // Optional: Set user agent, viewport, etc. if needed
-    // await page.setUserAgent('...');
-    // await page.setViewport({ width: 1280, height: 800 });
-
+    
     for (const username of usernamesToCheck) {
       try {
         await page.goto(`https://account.aq.com/CharPage?id=${username}`, {
@@ -33,21 +30,17 @@ async function workerCheckAvailability(browserWSEndpoint, usernamesToCheck) {
         if (isAvailable) {
           console.log(`  Worker ${workerData.workerId}: Available - ${username}`);
           availableUsernames.push(username);
-        } else {
-          // Optional: Log taken usernames if needed
-          // console.log(`  Worker ${workerData.workerId}: Taken/Error - ${username}`);
         }
       } catch (error) {
-        console.error(`  Worker ${workerData.workerId}: Error checking ${username}: ${error.message}`);
-        // Continue to next username on error
+        // Silently continue to next username on error
       }
     }
     await page.close();
   } catch (error) {
+    // Only log critical worker errors
     console.error(`  Worker ${workerData.workerId}: General error: ${error}`);
   } finally {
     if (browser) {
-      // We connected, not launched, so just disconnect
       await browser.disconnect();
     }
   }
@@ -57,7 +50,6 @@ async function workerCheckAvailability(browserWSEndpoint, usernamesToCheck) {
 if (!isMainThread) {
   // This code runs in the worker thread
   const { browserWSEndpoint, usernamesToCheck, workerId } = workerData;
-  console.log(`Worker ${workerId} started with ${usernamesToCheck.length} usernames.`);
   workerCheckAvailability(browserWSEndpoint, usernamesToCheck)
     .then(availableUsernames => {
       parentPort.postMessage({ availableUsernames }); // Send results back to main thread
@@ -80,18 +72,49 @@ async function runMain() {
   const numWorkers = process.argv[3] ? parseInt(process.argv[3], 10) : os.cpus().length;
   console.log(`Using ${numWorkers} workers.`);
 
-  let usernames;
+  let allUsernamesFromFile;
   try {
-    usernames = (await fs.readFile(inputFile, 'utf-8')).split(/\r?\n/).map(u => u.trim()).filter(Boolean);
-    if (usernames.length === 0) {
+    allUsernamesFromFile = (await fs.readFile(inputFile, 'utf-8')).split(/\r?\n/).map(u => u.trim()).filter(Boolean);
+    if (allUsernamesFromFile.length === 0) {
       console.log('Input file is empty or contains no valid usernames.');
       return;
     }
-    console.log(`Read ${usernames.length} usernames from ${inputFile}`);
+    console.log(`Read ${allUsernamesFromFile.length} total usernames from ${inputFile}`);
   } catch (error) {
     console.error(`Error reading usernames file ${inputFile}: ${error}`);
     process.exit(1);
   }
+
+  // Read existing available usernames to avoid re-checking
+  let existingAvailableUsernames = new Set();
+  try {
+    const existingContent = await fs.readFile(AVAILABLE_USERNAMES_FILE, 'utf-8');
+    existingContent.split(/\r?\n/).forEach(u => {
+      const trimmed = u.trim();
+      if (trimmed) {
+        existingAvailableUsernames.add(trimmed);
+      }
+    });
+    console.log(`Loaded ${existingAvailableUsernames.size} existing available usernames from ${AVAILABLE_USERNAMES_FILE}.`);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      console.log(`'${AVAILABLE_USERNAMES_FILE}' not found, will check all usernames.`);
+    } else {
+      console.error(`Error reading ${AVAILABLE_USERNAMES_FILE}: ${error}`);
+      // Decide if you want to exit or continue without the check
+      // process.exit(1);
+    }
+  }
+
+  // Filter out usernames that are already known to be available
+  const usernamesToCheck = allUsernamesFromFile.filter(u => !existingAvailableUsernames.has(u));
+
+  if (usernamesToCheck.length === 0) {
+    console.log('All usernames from the input file are already listed in available_usernames.txt. No checks needed.');
+    return;
+  }
+  console.log(`Filtered list: ${usernamesToCheck.length} usernames need to be checked online.`);
+
 
   let browser;
   try {
@@ -102,15 +125,17 @@ async function runMain() {
     const browserWSEndpoint = browser.wsEndpoint();
 
     console.log('Distributing usernames to workers...');
-    const totalUsernames = usernames.length;
+    // Use the filtered list 'usernamesToCheck' for distribution
+    const totalUsernames = usernamesToCheck.length;
     const usernamesPerWorker = Math.ceil(totalUsernames / numWorkers);
     const workerPromises = [];
-    let allAvailableUsernames = [];
+    let newlyAvailableUsernames = []; // Renamed from allAvailableUsernames
 
     for (let i = 0; i < numWorkers; i++) {
       const start = i * usernamesPerWorker;
       const end = start + usernamesPerWorker;
-      const usernamesChunk = usernames.slice(start, end);
+      // Slice from the filtered list
+      const usernamesChunk = usernamesToCheck.slice(start, end);
 
       if (usernamesChunk.length > 0) {
         const worker = new Worker(__filename, {
@@ -123,8 +148,8 @@ async function runMain() {
 
         const promise = new Promise((resolve, reject) => {
           worker.on('message', (message) => {
-            console.log(`Worker ${i + 1} finished, found ${message.availableUsernames.length} available usernames.`);
-            allAvailableUsernames = allAvailableUsernames.concat(message.availableUsernames);
+            // Collect newly found available usernames
+            newlyAvailableUsernames = newlyAvailableUsernames.concat(message.availableUsernames);
             resolve();
           });
           worker.on('error', (error) => {
@@ -146,14 +171,15 @@ async function runMain() {
     await Promise.all(workerPromises);
 
     // --- Process Results ---
-    if (allAvailableUsernames.length > 0) {
+    // Process only the newly found available usernames
+    if (newlyAvailableUsernames.length > 0) {
       console.log(`
-Found ${allAvailableUsernames.length} total available usernames. Saving to ${AVAILABLE_USERNAMES_FILE}...`);
+Found ${newlyAvailableUsernames.length} new available usernames. Saving to ${AVAILABLE_USERNAMES_FILE}...`);
       try {
-        // Use Set to ensure uniqueness before writing
-        const uniqueUsernames = [...new Set(allAvailableUsernames)];
-        await fs.appendFile(AVAILABLE_USERNAMES_FILE, uniqueUsernames.join('\n') + '\n');
-        console.log('Successfully saved available usernames.');
+        // Ensure uniqueness among the newly found names before writing
+        const uniqueNewUsernames = [...new Set(newlyAvailableUsernames)];
+        await fs.appendFile(AVAILABLE_USERNAMES_FILE, uniqueNewUsernames.join('\n') + '\n');
+        console.log('Successfully saved new available usernames.');
       } catch (error) {
         console.error(`Error writing to ${AVAILABLE_USERNAMES_FILE}: ${error}`);
       }
